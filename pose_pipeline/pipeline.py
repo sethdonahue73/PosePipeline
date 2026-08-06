@@ -6,11 +6,13 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import shutil
+from pathlib import Path
 
 import datajoint as dj
 
 from .utils.keypoint_matching import match_keypoints_to_bbox
 from .env import add_path
+from workflow import DB_PREFIX
 
 if "custom" not in dj.config:
     dj.config["custom"] = {}
@@ -18,6 +20,8 @@ if "custom" not in dj.config:
 db_prefix = dj.config["custom"].get("database.prefix", "")
 
 schema = dj.schema(db_prefix + "pose_pipeline")
+vit_schema = dj.schema(DB_PREFIX + "VIT_inference")
+VITPOSE_ROOT = Path(__file__).resolve().parents[1] / "3rdparty" / "vitpose_mobile"
 
 
 @schema
@@ -79,12 +83,50 @@ class Video(dj.Manual):
                 cap = cv2.VideoCapture(video)
                 break
 
+        cap.release()
+
+        # Some cameras (e.g. on the SHR rig) are physically mounted rotated - 90 deg
+        # or fully inverted, with no rotation flag in the file itself, so the raw
+        # frames come back sideways/upside-down and bbox/pose detectors trained on
+        # upright people degrade badly. VideoRotation is populated at ingestion time
+        # from Vicon calibration (see vicon_utils.camera_image_rotation); apply that
+        # correction here, once, at the single choke point every caller reads
+        # through, rather than patching each detector individually.
+        rotation_code = 0
+        if VideoRotation & key:
+            rotation_code = (VideoRotation & key).fetch1("rotation_code")
+
+        if rotation_code:
+            transpose = {90: "transpose=2", 180: "transpose=1,transpose=1", 270: "transpose=1"}[rotation_code]
+            fd, rotated = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+            subprocess.run(["ffmpeg", "-y", "-i", video, "-vf", transpose, "-c:v", "libx264", "-b:v", "1M", rotated])
+            os.remove(video)
+            video = rotated
+
         if return_cap:
+            cap = cv2.VideoCapture(video)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             return cap
         else:
-            cap.release()
             return video
+
+
+@schema
+class VideoRotation(dj.Manual):
+    definition = """
+    # Correction needed to bring the floor to the bottom of frame for videos from
+    # cameras that are physically mounted rotated (e.g. the SHR rig mixes upright,
+    # rotated-90, and inverted cameras). Derived from Vicon extrinsic calibration
+    # by vicon_utils.camera_image_rotation() rather than inspected from pixels -
+    # see GenerateSingleAndMultiCameraRecording in ingestion.py, which populates
+    # this alongside Video for every camera it has calibration for. Videos with no
+    # row here (e.g. ingested before this existed, or no calibration available)
+    # are treated as needing no correction - see Video.get_robust_reader.
+    -> Video
+    ---
+    rotation_code   : smallint   # degrees clockwise correction needed: one of 0, 90, 180, 270
+    """
 
 
 @schema
@@ -104,7 +146,8 @@ class VideoInfo(dj.Computed):
     def make(self, key, override=False):
 
         key = key.copy()
-        video, start_time = (Video & key).fetch1("video", "start_time")
+        start_time = (Video & key).fetch1("start_time")
+        video = Video.get_robust_reader(key, return_cap=False)
 
         cap = cv2.VideoCapture(video)
         key["fps"] = fps = cap.get(cv2.CAP_PROP_FPS)
@@ -298,7 +341,7 @@ class BottomUpBridging(dj.Computed):
 
     def make(self, key):
 
-        from pose_pipeline.wrappers.bridging import bridging_formats_bottom_up
+        from workflow.pipelines.PosePipeline.pose_pipeline.wrappers.bridging import bridging_formats_bottom_up
 
         res = bridging_formats_bottom_up(key)
         key.update(res)
